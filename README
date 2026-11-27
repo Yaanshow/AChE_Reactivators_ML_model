@@ -1,0 +1,235 @@
+# QSAR Classification Model for VX‑hAChE Reactivation by Oximes
+
+This repository documents, and allows full reproduction of, a binary QSAR model that
+discriminates **high vs. low reactivation activity** of oxime-type compounds against
+VX-inhibited human acetylcholinesterase (hAChE).
+
+The model uses **7 quantum-chemical / physicochemical descriptors + 1024-bit Morgan
+circular fingerprints**, and the final predictor is a **grid-search-optimized Random
+Forest classifier**. Validation covers stratified 5-fold cross-validation, an
+independent test set, Y-scrambling permutation testing, multi-seed stability analysis,
+Tanimoto-based applicability domain (AD), SHAP interpretation and a 7-model comparison.
+
+---
+
+## 1. Repository layout
+
+```
+.
+├── data_file_LUMO_HOMO_gap_126_freeTotalScore_N_natural_charge_free_pKa.xlsx   # training data (129 compounds)
+├── WZ_redesigned_compounds_7_features.xlsx                                     # external screening set (79 rows, 77 valid)
+├── train_qsar_binary.py        # training / validation / plotting script
+├── predict_7features.py        # standalone prediction script (wrapper class)
+├── rf_tuned_best.pkl           # final tuned Random Forest (main model)
+├── standard_scaler.pkl         # StandardScaler fitted on the training split (REQUIRED)
+├── ad_train_fps.joblib         # training-set RDKit fingerprints for AD calculation
+└── README.md
+```
+
+### Data files
+
+| File | Content | Size |
+|---|---|---|
+| `data_file_..._free_pKa.xlsx` | Training set: `Index`, `No` (compound ID 1–129), `smi`, 7 descriptors, `VX-hAChE` (continuous reactivation score, %) | 129 compounds, 11 columns |
+| `WZ_redesigned_compounds_7_features.xlsx` | External screening set: `smi` + the same 7 descriptors, no activity label | 79 rows, **77 usable** (last 2 rows are empty) |
+
+Training-set target `VX-hAChE`: min −1.98, median **12.60**, max 94.00.
+Median split gives **64 positives / 65 negatives**.
+
+---
+
+## 2. Descriptor definitions
+
+| # | Descriptor (training name) | Name used in screening file | Meaning |
+|---|---|---|---|
+| 1 | `HOMO-1` | `HOMO-1` | Energy of HOMO−1 (eV) |
+| 2 | `LUMO_HOMO_gap` | `LUMO_HOMO_gap (eV)` | LUMO–HOMO gap (eV) |
+| 3 | `Crash` | `Crash` | Steric/repulsion descriptor |
+| 4 | `Polar` | `Polar` | Polarizability-related descriptor |
+| 5 | `Molar Volume` | `Molar Volume` | Molar volume |
+| 6 | `O Mulliken Charge` | `O Natural Charge` | Charge on the oxime oxygen |
+| 7 | `Tot(D)` | `Tot(D)` | Total dipole moment (D) |
+
+⚠️ **Column-name aliases.** The screening file uses slightly different headers than the
+training file. They must be mapped explicitly before prediction (see §6), otherwise the
+feature matrix is silently misaligned.
+
+> All descriptors must be computed with **exactly the same DFT level of theory, basis set,
+> charge/multiplicity and conformer protocol** as the training set. This information must be
+> inserted here when the paper is finalized — it is not recoverable from the tables alone.
+
+Sanity check (training-set ranges, useful to verify a re-run):
+
+| Descriptor | min | median | max |
+|---|---|---|---|
+| HOMO-1 | −13.478 | −5.711 | −5.205 |
+| LUMO_HOMO_gap | 2.922 | 4.194 | 5.305 |
+| Crash | −8.170 | −2.380 | −0.280 |
+| Polar | 0.000 | 2.290 | 4.050 |
+| Molar Volume | 98.524 | 269.356 | 413.081 |
+| O Mulliken Charge | −0.539 | −0.495 | −0.397 |
+| Tot(D) | 0.3786 | 3.0481 | 8.5521 |
+
+---
+
+## 3. Environment
+
+```bash
+python >= 3.9
+pip install pandas numpy scikit-learn matplotlib seaborn joblib rdkit shap xgboost openpyxl
+```
+
+Recommended versions (record yours in the paper; tree-model outputs are mildly
+version-dependent):
+
+```
+scikit-learn == 1.3.2
+rdkit        == 2023.9.1
+xgboost      == 2.0.3
+shap         == 0.44.0
+pandas       == 2.1.4
+numpy        == 1.26.4
+```
+
+---
+
+## 4. Modeling protocol (exact settings used)
+
+| Item | Value |
+|---|---|
+| Random seed | `42` |
+| Train/test split | 80/20, `train_test_split`, **stratified on the binarized label** |
+| Label definition | `1` if `VX-hAChE > 12.60` (median), else `0` |
+| Feature scaling | `StandardScaler`, **fitted on the training split only**, applied to test set |
+| Cross-validation | `StratifiedKFold(n_splits=5, shuffle=True, random_state=42)`, metric = ROC-AUC |
+| Morgan fingerprint | `radius=2`, `nBits=1024` |
+| Feature vector | `[7 descriptors] + [1024 FP bits]` = **1031 dimensions** |
+| Classifiers compared | RandomForest, GradientBoosting, DecisionTree, LogisticRegression, XGBoost, KNN (k=5), MLP (64,32) |
+| RF grid search | `max_depth ∈ {3,5,8,None}`, `min_samples_split ∈ {4,8,12}`, `min_samples_leaf ∈ {2,4,6}`, `scoring="roc_auc"`, 5-fold |
+| Applicability domain | max Tanimoto similarity to training fingerprints, **threshold 0.35** |
+| Y-scrambling | 200 label permutations, RF, 5-fold CV-AUC, empirical p-value |
+| Stability seeds | `[0, 42, 123, 2025, 999]`, each re-splitting and re-fitting its own scaler |
+
+---
+
+## 5. Reproducing the training and validation
+
+```bash
+python train_qsar_binary.py
+```
+
+The script expects
+`data_file_LUMO_HOMO_gap_126_freeTotalScore_N_natural_charge_free_pKa.xlsx` in the
+working directory and writes:
+
+| Output | Content |
+|---|---|
+| `binary_class_result.csv` | Test AUC / precision / recall / F1 + CV-AUC per model |
+| `binary_class_result_with_train_mcc.csv` | Train & test AUC and MCC per model |
+| `binary_tree_feature_importance.csv` | Tree-model feature importances |
+| `y_scrambling_result_200runs.csv` | 200 permutation runs |
+| `multi_seed_stability.csv` | 5-seed stability results |
+| `testset_AD_analysis.csv` | Per-compound AD metrics and RF predictions |
+| `feature_target_correlation.csv` | Pearson / point-biserial correlations |
+| `rf_tuned_best.pkl`, `standard_scaler.pkl`, `ad_train_fps.joblib` | Deployable model artifacts |
+| `binary_ROC_curves.png`, `tuned_rf_roc_pr.png`, `rf_confusion_matrix.png`, `rf_training_scatter.png`, `rf_test_scatter.png`, `model_comparison_bar.png`, `ad_scatter_testset.png`, `multi_seed_boxplot.png`, `y_scrambling_hist_200runs.png`, `shap_beeswarm_physicochem.png`, `shap_bar_importance.png`, `physicochem_corr_heatmap.png`, `feature_target_pointbiserial_bar.png` | Figures |
+
+**Reproduction checkpoints.** A correct re-run should print:
+- binary threshold `12.600`, `64` positives / `65` negatives
+- total feature dimension `1031`
+- `len(ad_train_fps) ≥ 103` (valid training fingerprints; a few may fail RDKit parsing)
+- RF grid search over 36 parameter combinations
+
+---
+
+## 6. Applying the model to new compounds
+
+### 6.1 Input preparation
+
+The input `.xlsx` / `.csv` must contain a SMILES column named `smi` and all 7 descriptor
+columns. Because header names differ between files, remap them first:
+
+```python
+import pandas as pd
+
+COLUMN_MAP = {
+    "LUMO_HOMO_gap (eV)": "LUMO_HOMO_gap",
+    "O Natural Charge":   "O Mulliken Charge",
+}
+
+df = pd.read_excel("WZ_redesigned_compounds_7_features.xlsx")
+df = df.rename(columns=COLUMN_MAP)
+
+# drop empty / non-parseable rows
+df = df.dropna(subset=["smi", "HOMO-1", "LUMO_HOMO_gap", "Crash",
+                       "Polar", "Molar Volume", "O Mulliken Charge", "Tot(D)"])
+df["smi"] = df["smi"].astype(str).str.strip()
+df = df[df["smi"] != ""]
+```
+
+Also guard SMILES parsing itself, since RDKit raises a hard `TypeError` when it receives
+a `float`/`NaN` instead of a string:
+
+```python
+def _get_fp(self, smi):
+    if pd.isna(smi):
+        return np.zeros(self.morgan_n_bits, dtype=np.float64), None
+    smi = str(smi).strip()
+    if smi == "":
+        return np.zeros(self.morgan_n_bits, dtype=np.float64), None
+    mol = Chem.MolFromSmiles(smi)
+    if mol is None:
+        return np.zeros(self.morgan_n_bits, dtype=np.float64), None
+    fp_obj = AllChem.GetMorganFingerprintAsBitVect(
+        mol, radius=self.morgan_radius, nBits=self.morgan_n_bits)
+    return np.array(fp_obj, dtype=np.float64), fp_obj
+```
+
+### 6.2 Run prediction
+
+```bash
+python predict_7features.py
+```
+
+Output `virtual_screening_result_with_AD_7features.csv` with columns:
+
+| Column | Meaning |
+|---|---|
+| `pred_high_activity_prob` | Probability of high reactivation activity (class 1) |
+| `pred_class` | Hard label at 0.5 |
+| `max_tanimoto` | Max Tanimoto similarity to the training set |
+| `inside_AD` | `True` if `max_tanimoto ≥ 0.35` |
+
+Results are sorted by `inside_AD` then by predicted probability, so the top-ranked
+entries are both reliable (in-domain) and most promising.
+
+**Do not** refit the scaler on new data — always `scaler.transform(...)`.
+Do not change Morgan `radius`/`nBits`; any change invalidates the saved model.
+
+---
+
+## 7. External screening set: known caveats
+
+`WZ_redesigned_compounds_7_features.xlsx` contains **79 rows, of which 2 (rows 78–79)
+are entirely empty**. The usable set is **77 compounds**. All 77 SMILES parse correctly
+under RDKit.
+
+`HOMO-1` contains one row with value `0.0` in the otherwise-missing block; after row
+dropping this does not propagate, but verify the descriptor columns are all populated
+for the compounds you intend to screen.
+
+---
+
+## 8. Reproducibility notes
+
+1. `PARTIAL` randomness: `RandomForestClassifier` and `StratifiedKFold` are seeded, but
+   XGBoost/MLP/KNN results depend on the installed versions; the reported RF numbers are
+   the reproducible reference.
+2. The scaler must be fitted **after** the split, never on the full dataset — this
+   avoids leakage and is already fixed in the script.
+3. `ad_train_fps.joblib` stores RDKit fingerprint objects, not NumPy arrays; it must be
+   regenerated if RDKit version changes (bit-vector serialization is version-sensitive).
+4. Binary labels are derived from the median, so **the model only ranks compounds
+   relative to this 129-compound training set**, it does not predict absolute activity.
+   Use the continuous `VX-hAChE` regression for absolute values.
+
